@@ -104,6 +104,7 @@ venv.bak/
 .mypy_cache/
 
 .idea
+.vscode
 /models
 screenshots/*.png
 screenshots/*.mp4
@@ -111,3 +112,5 @@ screenshots/*.webm
 
 replays/
 results/
+
+dev/

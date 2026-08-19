@@ -13,3 +13,8 @@ torch = [
     "torch>=2.13.0",
     "torchvision>=0.28.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.3",
+]

@@ -7,3 +7,9 @@ dependencies = [
     "pygame>=2.6.1",
     "tqdm>=4.70.0",
 ]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+]

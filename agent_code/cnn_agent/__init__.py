@@ -1,0 +1,1 @@
+"""Factorized-CNN Bomberman agent."""

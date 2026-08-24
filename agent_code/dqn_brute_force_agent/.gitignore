@@ -1,7 +1,0 @@
-# Training checkpoints/artifacts (regenerate via train.py); model.pt is the
-# tracked inference weight, these are not what callbacks.py loads.
-checkpoint.pt
-best_model.pt
-replay.pkl
-training_metrics.jsonl
-logs/

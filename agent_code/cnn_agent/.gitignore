@@ -1,5 +1,0 @@
-# Standalone-training run outputs (checkpoints, metrics, per-round snapshots);
-# regenerate via standalone_training. model.pt at the package root is the
-# tracked inference weight loaded by callbacks.py and is not covered here.
-runs/
-logs/

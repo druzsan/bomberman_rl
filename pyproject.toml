@@ -19,3 +19,22 @@ dev = [
     "ruff>=0.16.3",
     "typer>=0.27.1",
 ]
+
+[tool.ruff]
+line-length = 100
+# The engine at the repository root is upstream and deliberately untouched.
+extend-exclude = ["main.py", "environment.py", "agents.py", "items.py", "replay.py",
+                  "agent_code/rule_based_agent", "agent_code/coin_collector_agent",
+                  "agent_code/random_agent", "agent_code/peaceful_agent",
+                  "agent_code/user_agent", "agent_code/fail_agent", "agent_code/tpl_agent",
+                  "agent_code/*/lib"]
+
+[tool.ruff.lint]
+# Local timestamps are intentional in run directory names and log lines; the
+# blind-except in the eval service is deliberate (an eval failure must never
+# kill a training run).
+ignore = ["DTZ005", "BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+# Keyword-style dict() reads better than a literal in the run configs.
+"training/configs/*.py" = ["C408"]

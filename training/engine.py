@@ -213,3 +213,30 @@ def set_model_env(path: str | os.PathLike | None) -> None:
         os.environ.pop("BOMBERMAN_MODEL", None)
     else:
         os.environ["BOMBERMAN_MODEL"] = str(Path(path).resolve())
+
+
+def disable_file_logging() -> None:
+    """Stop the engine from opening a log file per world and per agent.
+
+    ``AgentRunner.__init__`` hardcodes ``agent_code/<name>/logs/<agent>.log`` in
+    ``mode="w"``.  With twenty actor processes each holding several worlds that
+    is dozens of handles all truncating the same files.  Replacing the handler
+    class in the worker process removes the churn entirely; the repository's own
+    modules are untouched.
+    """
+    class _Null(logging.Handler):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def emit(self, record):
+            pass
+
+    logging.FileHandler = _Null
+
+
+def reset_engine_loggers() -> None:
+    """Drop accumulated handlers so rebuilding worlds does not leak them."""
+    for name in list(logging.root.manager.loggerDict):
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)

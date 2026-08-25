@@ -94,7 +94,7 @@ def act(self: AgentContext, game_state: GameState) -> Action:
     if game_state["round"] != self.current_round:
         _reset_round(self, game_state)
 
-    info = analyse(game_state)
+    info = analyse(game_state, with_bomb_slack=True)
     sx, sy = info.pos
     self.history.append((sx, sy))
 

@@ -14,6 +14,9 @@ F1   ``target_dir``              0-3 move, 4 here, 5 none                      6
 F2   ``escape_dir``              0-3 move, 4 wait, 5 doomed, 6 already safe    7
 F3   ``danger_now``              0-3 tau, 4 tau>=4, 5 safe                     6
 F4   ``walkable``                4-bit mask over the move directions          16
+F4b  ``move_status``             base-3 per direction: 0 blocked, 1 enterable  81
+                                 but with no proven escape, 2 survivable
+F4c  ``wait_ok``                 standing still still has a proven escape       2
 F5   ``bomb_ready``              bool                                          2
 F6   ``bomb_here_value``         0 suicide, 1 pointless, 2 ok, 3 good          4
 F7   ``opp_dir``                 0-3 move, 4 none                              5
@@ -32,7 +35,7 @@ from numpy.typing import NDArray
 
 from . import danger, pathfind
 from .board import DELTAS, N_ACTIONS, crate_adjacent
-from .symmetry import ACTION_MAP, BITS4_MAP, DIR5_MAP, DIR6_MAP, INVERSE, N_G
+from .symmetry import ACTION_MAP, BITS4_MAP, DIR5_MAP, DIR6_MAP, DIR_MAP, INVERSE, N_G
 from .types import Coordinate, GameState
 
 # F1 / F2 sentinels
@@ -47,6 +50,8 @@ OBJ_NONE, OBJ_COIN, OBJ_CRATE, OBJ_OPPONENT = 0, 1, 2, 3
 #: Number of distinct values per feature block, keyed by block name.
 CARDINALITY = {
     "target_dir": 6,
+    "move_status": 81,
+    "wait_ok": 2,
     "escape_dir": 7,
     "danger_now": 6,
     "walkable": 16,
@@ -57,9 +62,24 @@ CARDINALITY = {
     "in_dead_end": 2,
 }
 
+def _move_status_map() -> np.ndarray:
+    """D4 map for the base-3 per-direction code."""
+    out = np.zeros((N_G, 81), dtype=np.int16)
+    for g in range(N_G):
+        for v in range(81):
+            digits = [(v // 3 ** d) % 3 for d in range(4)]
+            new = 0
+            for d in range(4):
+                new += digits[d] * 3 ** int(DIR_MAP[g, d])
+            out[g, v] = new
+    return out
+
+
 #: How each block transforms under a D4 group element.
 _MAPS = {
     "target_dir": DIR6_MAP,
+    "move_status": _move_status_map(),
+    "wait_ok": np.tile(np.arange(2, dtype=np.int8), (N_G, 1)),
     "escape_dir": np.concatenate(
         [DIR6_MAP[:, :4], np.full((N_G, 3), [4, 5, 6], dtype=np.int8)], axis=1
     ),
@@ -73,6 +93,19 @@ _MAPS = {
 }
 
 FEATURE_SETS: dict[str, tuple[str, ...]] = {
+    # The tabular sets the project actually trains on.  ``move_status`` replaces
+    # the plain walkability mask: naming which neighbours are *provably fatal*
+    # is what makes a safe policy representable at all -- with only
+    # ``escape_dir`` the table cannot tell "this neighbour is a death trap"
+    # from "this one is fine", so the two average together and the greedy action
+    # is decided by noise (see dev/experiments/003).
+    "TQ-M": ("target_dir", "move_status", "wait_ok", "danger_now", "bomb_ready",
+             "bomb_here_value", "opp_dir", "opp_dist"),
+    "TQ-M-solo": ("target_dir", "move_status", "wait_ok", "danger_now", "bomb_ready",
+                  "bomb_here_value"),
+    # Ablation variants: the same set with the survivability information removed.
+    "TQ-M-nosurv": ("target_dir", "walkable", "escape_dir", "danger_now", "bomb_ready",
+                    "bomb_here_value", "opp_dir", "opp_dist"),
     "TQ-A": ("target_dir", "walkable"),
     "TQ-B": ("target_dir", "escape_dir", "danger_now", "walkable", "bomb_ready",
              "bomb_here_value"),
@@ -102,6 +135,8 @@ class StateInfo:
     escape: NDArray[np.int16]
     escape_possible: bool
     safe_here: bool
+
+    survivable: NDArray[np.bool_]
 
     objective: int
     obj_dist: int
@@ -136,7 +171,8 @@ class StateInfo:
     blocks: dict[str, int] = dc_field(default_factory=dict)
 
 
-def analyse(game_state: GameState, *, with_opponents: bool = True) -> StateInfo:
+def analyse(game_state: GameState, *, with_opponents: bool = True,
+            with_bomb_slack: bool = False) -> StateInfo:
     """Compute the full state analysis for one snapshot."""
     field = game_state["field"]
     bombs = game_state["bombs"]
@@ -153,16 +189,25 @@ def analyse(game_state: GameState, *, with_opponents: bool = True) -> StateInfo:
 
     danger_tau = danger.own_tile_danger(lethal, (sx, sy))
     safe_here = lethal[sx, sy] == 0
-    if safe_here:
-        escape = np.full(5, -1, dtype=np.int16)
-        escape_possible, escape_mask = True, 0
-    else:
+    # Computed even when the current tile is safe: stepping into a pending blast
+    # is exactly the mistake the survivability code has to be able to express.
+    # When nothing on the board is lethal at any horizon there is nothing to
+    # escape from, and the two searches below can be skipped entirely -- worth
+    # doing, they are the most expensive part of this function.
+    any_danger = bool(lethal.any())
+    if any_danger:
         escape = danger.escape_taus(lethal, blocked, (sx, sy), blocked_now=occupied)
-        escape_possible = danger.survivable(escape)
-        escape_mask = 0
-        if escape_possible:
-            best_tau = int(escape[escape >= 0].min())
-            escape_mask = int(((escape == best_tau) * (1 << np.arange(5))).sum())
+    else:
+        escape = np.zeros(5, dtype=np.int16)
+        for k, (dx, dy) in enumerate(DELTAS):
+            if blocked[sx + dx, sy + dy] or occupied[sx + dx, sy + dy]:
+                escape[k] = -1
+    survivable_actions = escape >= 0
+    escape_possible = bool(survivable_actions.any())
+    escape_mask = 0
+    if escape_possible:
+        best_tau = int(escape[survivable_actions].min())
+        escape_mask = int(((escape == best_tau) * (1 << np.arange(5))).sum())
 
     # Objective: nearest reachable coin, else a free tile next to a crate, else
     # the nearest opponent.  Each fallback only costs a BFS when the previous
@@ -188,6 +233,17 @@ def analyse(game_state: GameState, *, with_opponents: bool = True) -> StateInfo:
     if others:
         threat = pathfind.distance_field(passable | occupied, occupied,
                                          max_dist=danger.MAX_TAU + 1)
+        # An escape proven only against *stationary* opponents is not an escape:
+        # measured on bfs_expert, trusting the optimistic model cost 45 points of
+        # suicide rate (62 % -> 17 %) because opponents walk into the one-wide
+        # corridor the plan routes through. Re-derive survivability with
+        # opponents modelled as obstacles that can move, and fall back to the
+        # optimistic set only when nothing survives the pessimistic one.
+        if any_danger:
+            strict = danger.escape_taus(lethal, blocked | occupied, (sx, sy), threat=threat)
+            if (strict >= 0).any():
+                escape = strict
+                survivable_actions = strict >= 0
 
     opp_dist, opp_dir_raw, opp_mask = -1, 4, 0
     if others and (with_opponents or objective == OBJ_NONE):
@@ -208,8 +264,9 @@ def analyse(game_state: GameState, *, with_opponents: bool = True) -> StateInfo:
             not others
             or danger.survives_bomb_here(field, bombs, explosion_map, others, (sx, sy),
                                          block_others=True, threat=threat))
-        bomb_safe_slack = bomb_safe and _has_slack(field, bombs, explosion_map,
-                                                   occupied, (sx, sy))
+        bomb_safe_slack = bomb_safe and (
+            not with_bomb_slack
+            or _has_slack(field, bombs, explosion_map, occupied, (sx, sy)))
     else:
         bomb_crates = bomb_hits = 0
         bomb_safe = bomb_safe_strict = bomb_safe_slack = False
@@ -227,6 +284,7 @@ def analyse(game_state: GameState, *, with_opponents: bool = True) -> StateInfo:
         n_others=len(others), field=field, passable=passable, lethal=lethal,
         blocked=blocked, occupied=occupied, danger_tau=danger_tau, escape=escape,
         escape_possible=escape_possible, safe_here=bool(safe_here),
+        survivable=survivable_actions,
         objective=objective, obj_dist=obj_dist, target_dir=target_dir,
         opp_dist=opp_dist, opp_dir_raw=opp_dir_raw, threat=threat,
         target_mask=target_mask, opp_mask=opp_mask, escape_mask=escape_mask,
@@ -275,11 +333,14 @@ def _blocks(info: StateInfo) -> dict[str, int]:
     danger_now = 5 if info.danger_tau < 0 else min(info.danger_tau, 4)
 
     walkable = 0
+    move_status = 0
     for k, (dx, dy) in enumerate(DELTAS):
         nx, ny = sx + dx, sy + dy
-        if (not info.blocked[nx, ny] and not info.occupied[nx, ny]
-                and not (info.lethal[nx, ny] & 1)):
+        enterable = not info.blocked[nx, ny] and not info.occupied[nx, ny]
+        if enterable and not (info.lethal[nx, ny] & 1):
             walkable |= 1 << k
+        if enterable:
+            move_status += (2 if info.survivable[k] else 1) * 3 ** k
 
     if not info.bombs_left or not info.bomb_safe_strict:
         bomb_here = 0
@@ -303,6 +364,8 @@ def _blocks(info: StateInfo) -> dict[str, int]:
 
     return {
         "target_dir": info.target_dir,
+        "move_status": move_status,
+        "wait_ok": int(info.survivable[4]),
         "escape_dir": escape_dir,
         "danger_now": danger_now,
         "walkable": walkable,

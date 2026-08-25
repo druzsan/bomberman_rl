@@ -84,16 +84,25 @@ DEFAULT_EVENT_REWARDS: dict[str, float] = {
     MOVED_DOWN: -0.02,
     MOVED_LEFT: -0.02,
     MOVED_RIGHT: -0.02,
+    # These two are symmetric over a bomb cycle and cancel exactly.
     ESCAPED_DANGER: 1.0,
     MOVED_INTO_DANGER: -1.0,
-    STAYED_IN_DANGER: -0.5,
+    # STAYED_IN_DANGER has no positive counterpart, so it does *not* cancel: at
+    # -0.5 it charged about -1.5 per bomb on top of MOVED_INTO_DANGER's -1.0,
+    # against roughly +2.1 of crate and coin reward.  Bombing came out net
+    # negative and the optimal policy under the shaped reward really was "never
+    # drop a bomb" -- which is exactly what the agent learned (0 crates, 0 coins,
+    # 0 % suicide).  Keep it small enough to discourage dawdling in a blast
+    # without inverting the sign of the decision it is attached to.
+    STAYED_IN_DANGER: -0.05,
     SUICIDAL_BOMB: -8.0,
     USELESS_BOMB: -1.5,
     GOOD_BOMB: 0.3,          # per crate in the blast
     BOMB_NEAR_OPPONENT: 2.0,
     TRAPPED_OPPONENT: 5.0,
     WALKED_INTO_DEAD_END: -0.5,
-    LOOP: -0.5,
+    LOOP: -0.1,          # fires ~170x/episode under a random policy; at -0.5 it
+                         # swamped every real reward in the smoke run
 }
 
 #: ``KILLED_SELF`` already includes the death penalty, so ``GOT_KILLED`` is not

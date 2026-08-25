@@ -19,7 +19,7 @@ import numpy as np
 
 from lib import symmetry as sym
 from lib.board import CRATE, FREE, WALL
-from lib.features import FEATURE_SETS, FeatureSpec, analyse
+from lib.features import _MAPS, FEATURE_SETS, FeatureSpec, analyse
 from lib.symmetry import BITS4_MAP, DIR_MAP, N_G
 
 
@@ -100,6 +100,14 @@ class FeatureEquivarianceTest(unittest.TestCase):
                     self.assertEqual(got.blocks[b], base.blocks[b], f"{b} {msg}")
                 self.assertEqual(got.blocks["walkable"],
                                  int(BITS4_MAP[g, base.blocks["walkable"]]), f"walkable {msg}")
+                self.assertEqual(got.blocks["move_status"],
+                                 int(_MAPS["move_status"][g, base.blocks["move_status"]]),
+                                 f"move_status {msg}")
+                self.assertEqual(got.blocks["wait_ok"], base.blocks["wait_ok"], f"wait_ok {msg}")
+                np.testing.assert_array_equal(
+                    got.survivable[:4], base.survivable[np.argsort(DIR_MAP[g])],
+                    err_msg=f"survivable {msg}")
+                self.assertEqual(bool(got.survivable[4]), bool(base.survivable[4]))
                 self.assertEqual(got.target_mask, int(BITS4_MAP[g, base.target_mask]),
                                  f"target_mask {msg}")
                 self.assertEqual(got.opp_mask, int(BITS4_MAP[g, base.opp_mask]),

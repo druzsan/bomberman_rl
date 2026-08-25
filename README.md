@@ -32,13 +32,20 @@ the shipped `callbacks.py` and `model.npz`.
 | `coin_collector_agent` | 2.84 | 24 % | 35 % | 47 % | 2.56 | 0.06 |
 | `rule_based_agent` | 3.38 | 26 % | 40 % | 53 % | 2.63 | 0.15 |
 | `bfs_expert` (not submittable) | 4.79 | 43 % | 79 % | 17 % | 3.14 | 0.33 |
-| **`q_tabular_agent`** | **5.91** [5.53, 6.30] | **54 %** | **89 %** | **9 %** | 2.77 | 0.63 |
+| `q_linear_agent` (S2a, 288 weights) | 4.96 | 49 % | 61 % | 32 % | – | – |
+| **`q_tabular_agent`** (S1, submission) | **5.91** [5.53, 6.30] | **54 %** | **89 %** | **9 %** | 2.77 | 0.63 |
 
 Solo: 50/50 coins in `coin-heaven` and 42.3/50 coins with 105 crates in
 `loot-crate`, both at 0 % suicide. Mean think time 0.9 ms, p99 2.9 ms, against a
 500 ms limit. `tools/check_submission.py` passes 18/18 on the shipped copy.
 
-Full battery and the S5a mask ablation: `dev/experiments/006-gates-and-mask-ablation.md`.
+**Head to head**, all four agents in the same game, 400 rounds, seating rotated:
+`bfs_expert` 3.85, `q_linear_agent` 3.52, `q_tabular_agent` 3.50,
+`rule_based_agent` 2.19. Beating `rule_based_agent` by 2.5 points does not mean
+beating a strong field — see `dev/experiments/008-model-comparison.md`.
+
+Full battery, the S5a mask ablation and the state-coverage check:
+`dev/experiments/`.
 
 ## Commands
 

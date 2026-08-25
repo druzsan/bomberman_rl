@@ -24,6 +24,7 @@ Invariants (``dev/plan.md`` §9.1):
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import multiprocessing as mp
@@ -124,13 +125,16 @@ class Driver:
         self.stage_ends = np.cumsum([s["steps"] for s in self.stages])
         self.total_steps = int(self.stage_ends[-1])
 
-        from agent_code.q_tabular_agent.train import CTRL
+        # The control-vector layout lives with the learner, so a second model
+        # only has to define its own CTRL rather than edit the driver.
+        train_module = importlib.import_module(f"agent_code.{cfg['agent']}.train")
         from lib.features import FeatureSpec
 
-        self.CTRL = CTRL
+        self.CTRL = train_module.CTRL
         spec = FeatureSpec(cfg["feature_set"])
-        self.tables = SharedTables(spec.n_states, cfg["feature_set"], cfg["fold"])
-        self.n_states = spec.n_states
+        n_rows = getattr(train_module, "n_parameter_rows", lambda s: s.n_states)(spec)
+        self.tables = SharedTables(n_rows, cfg["feature_set"], cfg["fold"])
+        self.n_states = n_rows
         self._init_ctrl()
 
         self.sink = JsonlSink(run_dir / "metrics.jsonl")

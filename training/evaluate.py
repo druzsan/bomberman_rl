@@ -63,10 +63,21 @@ def _run_slice(job) -> list[dict]:
         return [play_round(world, s, timer=timer).as_dict() for s in seeds]
 
 
+#: A pool whose worker is killed never returns from ``map``, and a training run
+#: whose evaluation thread is stuck in one silently stops producing monitoring
+#: points for the rest of its life.  Measured once, at some cost.  Every
+#: evaluation therefore has a deadline -- but a *generous* one: the deadline
+#: exists to escape a hang, not to bound legitimate work, and an over-tight
+#: value simply converts slow suites into failed ones.  The self-consistency
+#: suite of four D4-averaged deep agents needs ~13 minutes at 400 rounds.
+EVAL_TIMEOUT_S = 3600
+
+
 def evaluate(agent: str, opponents: list[str], *, scenario: str = "classic",
              rounds: int = 100, seed_base: int = MONITOR_SEED_BASE, workers: int = 8,
              model: str | None = None, strict: bool = True,
-             pool: mp.pool.Pool | None = None) -> list[dict]:
+             pool: mp.pool.Pool | None = None,
+             timeout: float = EVAL_TIMEOUT_S) -> list[dict]:
     """Play ``rounds`` fixed-seed rounds and return the per-round records."""
     seeds = [seed_base + i for i in range(rounds)]
     workers = max(1, min(workers, rounds))
@@ -76,11 +87,30 @@ def evaluate(agent: str, opponents: list[str], *, scenario: str = "classic",
     if len(jobs) == 1:
         return _run_slice(jobs[0])
     if pool is not None:
-        parts = pool.map(_run_slice, jobs)
+        parts = pool.map_async(_run_slice, jobs).get(timeout)
     else:
         ctx = mp.get_context("spawn")
-        with ctx.Pool(len(jobs)) as p:
-            parts = p.map(_run_slice, jobs)
+        p = ctx.Pool(len(jobs))
+        try:
+            parts = p.map_async(_run_slice, jobs).get(timeout)
+        finally:
+            # ``terminate`` rather than ``close``: closing a pool whose worker
+            # has died waits for it forever, which is the failure this timeout
+            # exists to escape.  After a successful map the workers are idle and
+            # terminating them costs nothing.
+            #
+            # ``terminate`` alone is not enough either.  A worker interrupted
+            # while it holds the result queue's write lock ignores SIGTERM and
+            # ``Pool.join`` then blocks in ``futex_wait`` forever -- the same
+            # hang, one function further on.  Measured, after the first version
+            # of this fix deadlocked the gate battery.  So: terminate, give each
+            # worker a moment, then ``SIGKILL`` whatever is left.
+            p.terminate()
+            for worker in getattr(p, "_pool", ()):
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    worker.kill()
+            p.join()
     records = [r for part in parts for r in part]
     records.sort(key=lambda r: r["seed"])
     return records

@@ -8,9 +8,10 @@ in `lib/`, `agent_code/`, `training/`, `tools/` and `tests/`.
 
 | path | what |
 |---|---|
-| `lib/` | single source of truth for shared primitives: the threat model, BFS, features, D4 symmetry, rewards |
-| `agent_code/q_tabular_agent/` | **S1 — tabular Q-learning with D4 folding. The submission candidate.** |
-| `agent_code/q_linear_agent/` | S2 — linear function approximation on the same features (second model) |
+| `lib/` | single source of truth for shared primitives: the threat model, BFS, features, board-plane encoding, the Q-network, D4 symmetry, rewards |
+| `agent_code/dqn_agent/` | **S3 — deep Q-network on board planes. The submission.** |
+| `agent_code/q_tabular_agent/` | S1 — tabular Q-learning with D4 folding (second model) |
+| `agent_code/q_linear_agent/` | S2 — linear function approximation on the same features (third model) |
 | `agent_code/bfs_expert/` | deterministic reference agent and sparring partner (not submittable: it does not learn) |
 | `training/` | driver, actors, in-environment evaluation, checkpointing, model selection. Never shipped |
 | `tools/` | `sync_lib` (vendors `lib/` into each agent), `check_submission` (the pre-flight gate) |
@@ -23,7 +24,7 @@ directory is self-contained and the shipped zip needs no import rewriting.
 ## Results
 
 400 rounds on the fixed gate seed block, stock `settings.py`, `train = False`,
-the shipped `callbacks.py` and `model.npz`.
+the shipped `callbacks.py` and model file.
 
 | agent | score/round | win rate | survival | suicide | coins | kills |
 |---|---|---|---|---|---|---|
@@ -33,30 +34,57 @@ the shipped `callbacks.py` and `model.npz`.
 | `rule_based_agent` | 3.38 | 26 % | 40 % | 53 % | 2.63 | 0.15 |
 | `bfs_expert` (not submittable) | 4.79 | 43 % | 79 % | 17 % | 3.14 | 0.33 |
 | `q_linear_agent` (S2a, 288 weights) | 4.96 | 49 % | 61 % | 32 % | – | – |
-| **`q_tabular_agent`** (S1, submission) | **5.91** [5.53, 6.30] | **54 %** | **89 %** | **9 %** | 2.77 | 0.63 |
+| `q_tabular_agent` (S1, ~600 states) | 6.10 | 54 % | 90 % | 9 % | 2.73 | 0.68 |
+| **`dqn_agent`** (S3, 533 k parameters) | **6.39** [6.04, 6.74] | **60 %** | **95 %** | **4.5 %** | **3.68** | 0.54 |
 
-Solo: 50/50 coins in `coin-heaven` and 42.3/50 coins with 105 crates in
-`loot-crate`, both at 0 % suicide. Mean think time 0.9 ms, p99 2.9 ms, against a
-500 ms limit. `tools/check_submission.py` passes 18/18 on the shipped copy.
+**Head to head decides it.** All four in the *same* game, 400 rounds, seating
+rotated across the four start corners:
 
-**Head to head**, all four agents in the same game, 400 rounds, seating rotated:
-`bfs_expert` 3.85, `q_linear_agent` 3.52, `q_tabular_agent` 3.50,
-`rule_based_agent` 2.19. Beating `rule_based_agent` by 2.5 points does not mean
-beating a strong field — see `dev/experiments/008-model-comparison.md`.
+| agent | score | 95 % CI | win rate |
+|---|---|---|---|
+| **`dqn_agent`** | **5.33** | [5.02, 5.64] | **43.8 %** |
+| `q_tabular_agent` | 3.98 | [3.68, 4.29] | 28.9 % |
+| `bfs_expert` | 3.27 | [3.02, 3.54] | 18.7 % |
+| `rule_based_agent` | 2.27 | [2.06, 2.48] | 8.6 % |
 
-Full battery, the S5a mask ablation and the state-coverage check:
-`dev/experiments/`.
+Against three `bfs_expert`s — an opponent neither model was tuned for — the deep
+agent scores 5.98 with its suicide rate unchanged at 5.8 %, where the tabular
+agent scores 3.16 with its suicide rate doubling.
+
+Think time, measured in a single process as the tournament runs it: `dqn_agent`
+15.9 ms mean / 16.8 ms p99, `q_tabular_agent` 0.49 / 1.06, against a 500 ms
+limit. `tools/check_submission.py` passes 19/19 on the shipped copy.
+
+Repeating the Task-4 measurement on the same seeds and the same model gives
+6.39, 6.46 and 6.32 — opponent-internal randomness is uncontrollable, so **6.4
+is the honest figure** and single decimals should not be quoted alone.
+
+Known failure: `dqn_agent` collects 40 of 50 coins in `coin-heaven`, a scenario
+it never trained on, where the tabular agent's hand-written BFS feature gets all
+50. Full battery, every ablation and the reasoning: `dev/experiments/`.
 
 ## Commands
 
 ```bash
-uv sync
+uv sync --extra torch                                     # torch is optional, S3 needs it
 uv run python -m unittest discover -s tests -t .          # conformance tests
-uv run python -m training.evaluate --agent q_tabular_agent --rounds 300
+uv run python -m training.evaluate --agent dqn_agent --rounds 400 --gate
+
+# S1, tabular
 uv run python -m training.driver --config training/configs/s1b.py --tag main
+
+# S3, deep: record the teacher, clone it, then reinforcement-learn from there
+uv run python -m training.bc collect --out data/expert --episodes 8000 --workers 24
+uv run python -m training.bc train --data data/expert --out runs/bc/main --steps 40000
+uv run python -m training.dqn_driver --config training/configs/s3_gamma95.py --tag main \
+    --override pretrained='"runs/bc/main/model.pt"' \
+    --override expert_episodes='"data/expert"'
+
 uv run python -m training.select_checkpoint --run runs/<dir> --rounds 400 --install
-uv run python -m training.gate_report --agent q_tabular_agent --rounds 400
-uv run python -m tools.check_submission --agent q_tabular_agent --rounds 300 --zip
+uv run python -m training.gate_report --agent dqn_agent --rounds 400
+uv run python -m training.tournament --agents dqn_agent q_tabular_agent bfs_expert \
+    rule_based_agent --rounds 400
+uv run python -m tools.check_submission --agent dqn_agent --rounds 400 --zip
 ```
 
 ## Things the engine does that cost us time

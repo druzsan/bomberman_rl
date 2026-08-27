@@ -1,8 +1,12 @@
 # `q_tabular_agent` — S1, tabular Q-learning with D4 folding
 
-**Submittable.** Pure numpy at inference; no torch, no `multiprocessing`, no
-absolute paths. The whole model is `model.npz` (a few hundred kB) next to this
-file.
+**Submittable, and the report's second model.** The primary submission is
+`agent_code/dqn_agent` (S3), which beats this agent 5.33 to 3.98 head to head;
+this one remains the "at least one model from the lecture" entry and is by far
+the cheaper of the two — 0.49 ms per step against 15.9 ms.
+
+Pure numpy at inference; no torch, no `multiprocessing`, no absolute paths. The
+whole model is `model.npz` (a few hundred kB) next to this file.
 
 ## Model
 

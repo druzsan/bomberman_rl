@@ -40,8 +40,34 @@ def gate_failures(agg: dict) -> list[str]:
     return out
 
 
-def candidates(run: Path, top: int) -> list[tuple[int, Path]]:
-    """Checkpoints that still exist on disk, best monitoring score first."""
+def artifact(path: Path) -> Path:
+    """The inference artifact inside a checkpoint directory.
+
+    S1/S2 export ``model.npz`` and S3 exports ``model.pt``; the selection logic
+    is identical, so it asks the checkpoint what it holds rather than being told.
+    """
+    for name in ("model.npz", "model.pt"):
+        if (path / name).exists():
+            return path / name
+    raise FileNotFoundError(f"no inference artifact in {path}")
+
+
+def candidates(run: Path, top: int, every: bool = False) -> list[tuple[int, Path]]:
+    """Checkpoints that still exist on disk, best monitoring score first.
+
+    ``every`` ignores the monitoring ranking and takes them all, which is what
+    is needed when a run's in-flight evaluation stalled or was never enabled:
+    the ranking then has to come from this pass itself.
+    """
+    if every:
+        out = [(int(p.name.split("_")[1]), p)
+               for p in sorted((run / "checkpoints").glob("step_*")) if p.is_dir()]
+        for name in ("best", "last"):
+            path = run / "checkpoints" / name
+            if path.exists() and all(path != q for _, q in out):
+                meta = json.loads((path / "meta.json").read_text())
+                out.append((int(meta.get("progress", -1)), path))
+        return out
     scored: dict[int, float] = {}
     for f in sorted((run / "eval" / "anchor").glob("step_*.json")):
         progress = int(f.stem.split("_")[1])
@@ -73,16 +99,19 @@ def main(argv=None) -> int:
                    help="copy the winner's model.npz into the agent directory")
     p.add_argument("--ignore-gate", action="store_true",
                    help="select purely by score, even if the gate fails")
+    p.add_argument("--all", action="store_true",
+                   help="evaluate every checkpoint on disk instead of the "
+                        "top --top by monitoring score")
     args = p.parse_args(argv)
 
     run = Path(args.run)
     cfg = json.loads((run / "config.json").read_text())["config"]
     agent = args.agent or cfg["agent"]
     results = []
-    for progress, path in candidates(run, args.top):
+    for progress, path in candidates(run, args.top, every=args.all):
         records = evaluate(agent, ["rule_based_agent"] * 3, scenario="classic",
                            rounds=args.rounds, seed_base=GATE_SEED_BASE,
-                           workers=args.workers, model=str(path / "model.npz"))
+                           workers=args.workers, model=str(artifact(path)))
         agg = summarise(records)
         failures = gate_failures(agg)
         print(format_table(f"{path.name} (step {progress})", agg))
@@ -105,8 +134,9 @@ def main(argv=None) -> int:
     print(f"wrote {out}")
     if args.install:
         copy_checkpoint(path, run / "checkpoints" / "selected")
-        target = REPO / "agent_code" / agent / "model.npz"
-        shutil.copy2(path / "model.npz", target)
+        source = artifact(path)
+        target = REPO / "agent_code" / agent / source.name
+        shutil.copy2(source, target)
         print(f"installed {target}")
     return 0
 

@@ -18,6 +18,8 @@ torch = [
 dev = [
     "ruff>=0.16.3",
     "typer>=0.27.1",
+    "matplotlib>=3.9",
+    "scipy>=1.14",
 ]
 
 [tool.ruff]
@@ -30,11 +32,7 @@ extend-exclude = ["main.py", "environment.py", "agents.py", "items.py", "replay.
                   "agent_code/*/lib"]
 
 [tool.ruff.lint]
-# Local timestamps are intentional in run directory names and log lines; the
-# blind-except in the eval service is deliberate (an eval failure must never
-# kill a training run).
 ignore = ["DTZ005", "BLE001"]
 
 [tool.ruff.lint.per-file-ignores]
-# Keyword-style dict() reads better than a literal in the run configs.
 "training/configs/*.py" = ["C408"]

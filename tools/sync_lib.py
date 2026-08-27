@@ -8,6 +8,13 @@ with no import rewriting and no symlinks (a zip cannot carry one).
 
     uv run python -m tools.sync_lib            # copy
     uv run python -m tools.sync_lib --check    # fail if any copy is stale
+
+One module is *not* copied everywhere.  ``lib/qnet.py`` imports torch at module
+level, and vendoring it into an agent that never touches it makes the shipped
+tree claim a dependency it does not have: ``check_submission`` reads the imports
+out of the whole directory, so a pure-numpy agent ended up with ``torch`` in its
+``requirements.txt`` and failing the "does it call ``set_num_threads``" check.
+So torch-only modules follow the agent that imports them.
 """
 
 from __future__ import annotations
@@ -23,6 +30,10 @@ SOURCE = REPO / "lib"
 AGENT_CODE = REPO / "agent_code"
 STAMP = "lib"
 
+#: Modules vendored only into agents whose own code imports them, keyed by the
+#: name that has to appear in an agent's sources.
+OPTIONAL = {"qnet.py": "qnet"}
+
 
 def agents_using_lib() -> list[Path]:
     """Agent directories that already contain a vendored ``lib/``, plus opt-ins."""
@@ -36,16 +47,27 @@ def agents_using_lib() -> list[Path]:
     return out
 
 
+def skipped_for(target: Path) -> set[str]:
+    """Optional modules this agent does not import, and must not be given."""
+    sources = "\n".join(p.read_text() for p in target.glob("*.py"))
+    return {name for name, token in OPTIONAL.items() if token not in sources}
+
+
 def sync(target: Path, check: bool = False) -> bool:
     dest = target / STAMP
+    skip = skipped_for(target)
     if check:
         if not dest.exists():
             return False
         cmp = filecmp.dircmp(SOURCE, dest, ignore=["__pycache__"])
-        return not (cmp.left_only or cmp.right_only or cmp.diff_files)
+        present = {p.name for p in dest.iterdir()}
+        missing = set(cmp.left_only) - skip
+        unwanted = set(OPTIONAL) & skip & present
+        return not (missing or unwanted or set(cmp.right_only) or cmp.diff_files)
     if dest.exists():
         shutil.rmtree(dest)
-    shutil.copytree(SOURCE, dest, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(SOURCE, dest,
+                    ignore=shutil.ignore_patterns("__pycache__", *skip))
     return True
 
 

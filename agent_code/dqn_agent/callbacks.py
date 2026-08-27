@@ -25,6 +25,9 @@ import numpy as np
 
 from .lib import danger, encode
 from .lib.board import ACTIONS, N_ACTIONS
+from .lib.search import SearchConfig
+from .lib.search import search as forward_search
+from .lib.sim import Sim
 from .lib.symmetry import ACTION_MAP, N_G, transform_plane
 from .lib.types import Action, AgentContext, Coordinate, GameState
 
@@ -121,6 +124,11 @@ def setup(self: AgentContext) -> None:
 
     self.rng = np.random.default_rng(SEED)
     self.torch = torch
+    #: Where we last dropped a bomb, or ``None``; see `act`.
+    self.my_bomb: Coordinate | None = None
+    #: How often the search actually ran, for the latency write-up.
+    self.searched_steps = 0
+    self.searched_leaves = 0
 
     # ``self.train`` matters here, not just the injection: a self-play league
     # runs *frozen* copies of this same agent as opponents inside the actor
@@ -136,6 +144,8 @@ def setup(self: AgentContext) -> None:
         self.plane_set = TRAINING_POLICY.plane_set
         self.use_mask = False
         self.tta = False
+        self.search = None
+        self.search_gap = 0.0
     else:
         from .lib.qnet import load as load_qnet
 
@@ -148,9 +158,12 @@ def setup(self: AgentContext) -> None:
         self.plane_set = self.net.cfg.plane_set
         self.use_mask = bool(meta.get("use_mask", False))
         self.tta = bool(meta.get("tta", False))
-        self.logger.info("loaded %s: %s, %d parameters, planes=%s, mask=%s, tta=%s",
+        self.search = search_config(meta)
+        self.search_gap = float(meta.get("search_gap", 0.05))
+        self.logger.info("loaded %s: %s, %d parameters, planes=%s, mask=%s, "
+                         "tta=%s, search=%s",
                          path, type(self.net).__name__, self.net.n_parameters(),
-                         self.plane_set, self.use_mask, self.tta)
+                         self.plane_set, self.use_mask, self.tta, self.search)
 
 
 def q_values(self: AgentContext, view: StateView, game_state: GameState) -> np.ndarray:
@@ -173,6 +186,68 @@ def q_values(self: AgentContext, view: StateView, game_state: GameState) -> np.n
         return q[np.arange(N_G)[:, None], ACTION_MAP].mean(axis=0)
 
 
+def search_config(meta: dict) -> SearchConfig | None:
+    """Read the S5b search settings out of the artifact's ``meta`` block.
+
+    ``None`` -- the default -- is the flat ``argmax`` the model shipped with, so
+    an artifact written before this existed behaves exactly as it always did.
+    """
+    if not meta.get("search"):
+        return None
+    return SearchConfig(depth=int(meta.get("search_depth", 3)),
+                        gamma=float(meta.get("search_gamma", 0.95)),
+                        max_leaves=int(meta.get("search_leaves", 48)))
+
+
+def leaf_values(self: AgentContext, states: list[GameState]) -> np.ndarray:
+    """One forward pass over every leaf the search produced.
+
+    Test-time augmentation is deliberately *not* applied here.  It costs eight
+    evaluations per state, a leaf costs ~3 ms, and the budget is ~160
+    evaluations a step -- so TTA at the leaves and a depth-3 tree cannot both be
+    afforded.  They are alternative ways to spend the same budget, which is why
+    the two are ablated against each other rather than stacked.
+    """
+    planes = np.stack([
+        encode.planes(gs, danger.lethal_bits(gs["field"], gs["bombs"],
+                                             gs["explosion_map"]), self.plane_set)
+        for gs in states])
+    with self.torch.inference_mode():
+        return self.net(self.torch.from_numpy(planes)).numpy()
+
+
+def searched(self: AgentContext, q: np.ndarray, mask: np.ndarray,
+             game_state: GameState) -> np.ndarray:
+    """Action values from a depth-limited search, or ``q`` unchanged.
+
+    The search runs only when the flat ``argmax`` is close to a tie.  Two
+    reasons, and the second is the one that matters:
+
+    * **Cost.**  A confident position is decided for ~3 ms; the budget is spent
+      where it can change something.
+    * **Risk.**  The search can then only overturn decisions the network
+      already considered close, so a search that is no good is bounded in how
+      much damage it can do -- and one that is good keeps every confident call
+      the shipped model already gets right.
+
+    ``search_gap`` is in the network's own units, where the whole value range
+    at ``gamma = 0.95`` is about 0.4 (E12), so a gap of 0.05 is a real tie
+    rather than a nominal one.
+    """
+    cfg = self.search
+    values = np.where(mask, q, -np.inf)
+    ordered = np.sort(values[np.isfinite(values)])
+    if len(ordered) < 2 or ordered[-1] - ordered[-2] >= self.search_gap:
+        return q
+    sim = Sim.from_game_state(game_state, self.my_bomb)
+    result = forward_search(sim, 0, lambda s: leaf_values(self, s), cfg)
+    self.searched_steps += 1
+    self.searched_leaves += result.leaves
+    if not np.isfinite(result.values).any():
+        return q
+    return result.values
+
+
 def greedy(self: AgentContext, q: np.ndarray, mask: np.ndarray) -> int:
     """Argmax over allowed actions, ties broken by our own generator."""
     values = np.where(mask, q, -np.inf)
@@ -193,4 +268,18 @@ def act(self: AgentContext, game_state: GameState) -> Action:
         safe = mask & view.survivable()
         if safe.any():
             mask = safe
-    return ACTIONS[greedy(self, q, mask)]
+    if self.search is not None:
+        # Our own bomb is the one piece of hidden state the search needs and the
+        # observation does not carry (`Sim.from_game_state`).  It is forgotten
+        # as soon as it is no longer on the board.
+        if self.my_bomb not in [(int(x), int(y)) for (x, y), _ in view.bombs]:
+            self.my_bomb = None
+        q = searched(self, q, mask, game_state)
+        # A searched value of -inf means "every line from here is lost", not
+        # "illegal"; masking it away again would discard the search's answer.
+        if np.isfinite(q[mask]).any():
+            mask = mask & np.isfinite(q)
+    action = ACTIONS[greedy(self, q, mask)]
+    if action == "BOMB":
+        self.my_bomb = view.pos
+    return action

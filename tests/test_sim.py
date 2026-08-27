@@ -186,6 +186,98 @@ class ObservationTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class PartialInformationTest(unittest.TestCase):
+    """``from_game_state`` cannot be exact.  It has to be exact about *danger*.
+
+    An agent sees no bomb owners and no coins under crates, so a position built
+    from an observation is not the position.  What the search needs from it is
+    narrower and testable: for every action available, whether taking it kills
+    us next step must agree with the real engine.  Anything less and the search
+    is confidently planning through deaths that are not there, or into ones that
+    are.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        quiet_logging()
+
+    def test_predicted_death_matches_the_engine_for_every_action(self):
+        from environment import BombeRLeWorld
+        from lib.board import ACTIONS
+
+        tmp = Path(tempfile.mkdtemp(prefix="simpi-"))
+        try:
+            args = make_args(scenario="classic", log_dir=str(tmp / "logs"))
+            world = BombeRLeWorld(args, [(a, False) for a in AGENTS])
+            world.rng = np.random.default_rng(11)
+            checked = deaths = 0
+            for _ in range(3):
+                world.new_round()
+                # `do_step` sets this; `get_state_for_agent` reads it, and we
+                # look at a state before the first step of the round.
+                world.user_input = None
+                my_bomb = None
+                while world.running:
+                    me = world.agents[0]
+                    if not me.dead:
+                        gs = world.get_state_for_agent(me)
+                        truth = Sim.from_world(world)
+                        view = Sim.from_game_state(gs, my_bomb)
+                        for action in ACTIONS:
+                            # Opponents frozen on both sides: the comparison is
+                            # of the two *models*, not of an opponent policy.
+                            others = {i: "WAIT" for i in truth.active if i != 0}
+                            a, b = truth.copy(), view.copy()
+                            a.step({0: action, **others})
+                            b.step({0: action, **{i: "WAIT" for i in b.active
+                                                  if i != 0}})
+                            self.assertEqual(
+                                a.agents[0].dead, b.agents[0].dead,
+                                f"step {world.step} action {action}: engine says "
+                                f"dead={a.agents[0].dead}, model says "
+                                f"{b.agents[0].dead}")
+                            self.assertEqual((a.agents[0].x, a.agents[0].y),
+                                             (b.agents[0].x, b.agents[0].y),
+                                             f"step {world.step} action {action}")
+                            checked += 1
+                            deaths += a.agents[0].dead
+                    world.do_step()
+                    bombs = {(b.x, b.y) for b in world.bombs
+                             if b.owner is world.agents[0]}
+                    my_bomb = next(iter(bombs), None)
+            world.end()
+            self.assertGreater(checked, 1000)
+            self.assertGreater(deaths, 10, "no lethal action was ever offered")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_what_it_reconstructs_of_the_position(self):
+        from environment import BombeRLeWorld
+
+        tmp = Path(tempfile.mkdtemp(prefix="simpi2-"))
+        try:
+            args = make_args(scenario="classic", log_dir=str(tmp / "logs"))
+            world = BombeRLeWorld(args, [(a, False) for a in AGENTS])
+            world.rng = np.random.default_rng(3)
+            world.new_round()
+            for _ in range(40):
+                world.do_step()
+            gs = world.get_state_for_agent(world.agents[0])
+            view = Sim.from_game_state(gs)
+            truth = Sim.from_world(world)
+            np.testing.assert_array_equal(view.arena, truth.arena)
+            self.assertEqual([(a.x, a.y, a.bombs_left) for a in view.agents],
+                             [(a.x, a.y, a.bombs_left) for a in truth.agents
+                              if not a.dead])
+            self.assertEqual(sorted((b.x, b.y, b.timer) for b in view.bombs),
+                             sorted((b.x, b.y, b.timer) for b in truth.bombs))
+            np.testing.assert_array_equal(view.danger_map(), truth.danger_map())
+            self.assertLessEqual(len(view.coins), len(truth.coins),
+                                 "coins under crates cannot be seen")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class BlastGeometryTest(unittest.TestCase):
     """§2.4 of the plan: blasts stop at walls and pass *through* crates."""
 

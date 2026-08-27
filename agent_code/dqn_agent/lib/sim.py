@@ -159,6 +159,59 @@ class Sim:
         )
         return sim
 
+    @classmethod
+    def from_game_state(cls, gs: dict, my_bomb: tuple[int, int] | None = None) -> Sim:
+        """Rebuild a position from what an *agent* can see.
+
+        This is the constructor the search actually uses, and unlike
+        :meth:`from_world` it works from partial information.  Three gaps, all
+        of which matter less than they look:
+
+        **Bomb ownership is not observable.**  ``game_state["bombs"]`` carries a
+        position and a timer and no owner.  Pass ``my_bomb`` -- the tile the
+        agent dropped its own bomb on, which it always knows -- and every other
+        bomb is attributed to an arbitrary opponent.  Under the default frozen
+        opponent model that is exactly enough: opponents never act, so their
+        ``bombs_left`` never gates anything, and the only attribution the search
+        prices is whether *we* get the kill.
+
+        **Explosions are observable but not their groupings.**  The engine's
+        ``explosion_map`` stores ``timer - 1`` of dangerous blasts, so ``>= 1``
+        means "lethal during the step you are about to take" and ``0`` means it
+        is not -- a blast at ``timer == 1`` reaches stage 1 in
+        ``update_explosions`` before ``evaluate_explosions`` sees it, and kills
+        nobody.  The reconstruction is therefore exact for danger: one blast
+        over every tile at ``>= 1``, ``timer = 2``.  It is owned by us when we
+        have no bomb on the board and no bomb in hand, since that is the case
+        where returning the bomb on time changes what we may do next.
+
+        **Coins under crates are invisible**, so a bombed crate reveals nothing
+        in the model.  The search does not price ``COIN_FOUND``, so the only
+        consequence is that :meth:`round_over` can fire early on a board whose
+        last crates hide coins.
+        """
+        field = np.array(gs["field"], dtype=np.int8)
+        name, score, bombs_left, (sx, sy) = gs["self"]
+        agents = [SimAgent(int(sx), int(sy), bool(bombs_left), False, int(score), name)]
+        for oname, oscore, obombs, (ox, oy) in gs["others"]:
+            agents.append(SimAgent(int(ox), int(oy), bool(obombs), False,
+                                   int(oscore), oname))
+        other = 1 if len(agents) > 1 else 0
+        bombs = [SimBomb(int(bx), int(by),
+                         0 if my_bomb is not None and (int(bx), int(by)) == tuple(my_bomb)
+                         else other,
+                         int(timer))
+                 for (bx, by), timer in gs["bombs"]]
+        lethal = np.argwhere(np.asarray(gs["explosion_map"]) >= 1)
+        ours = not bombs_left and not any(b.owner == 0 for b in bombs)
+        explosions = ([SimExplosion(tuple((int(x), int(y)) for x, y in lethal),
+                                    0 if ours else other, EXPLOSION_TIMER, 0)]
+                      if len(lethal) else [])
+        return cls(arena=field, agents=agents, active=list(range(len(agents))),
+                   bombs=bombs, explosions=explosions,
+                   coins=[(int(cx), int(cy), True) for cx, cy in gs["coins"]],
+                   step_no=int(gs["step"]))
+
     def copy(self) -> Sim:
         """A deep copy cheap enough to make one per search node."""
         return Sim(
@@ -320,6 +373,40 @@ class Sim:
                 for cx, cy in ex.coords:
                     out[cx, cy] = True
         return out
+
+    def to_game_state(self, me: int, round_no: int = 1) -> dict:
+        """The dict the engine would hand agent ``me`` in this position.
+
+        Byte-for-byte what ``GenericWorld.get_state_for_agent`` builds, because
+        it is fed to :func:`lib.encode.planes` and any difference between a
+        searched position and a played one is a difference the network was never
+        trained on.  That includes the ``explosion_map`` quirk: it stores
+        ``timer - 1`` of *dangerous* explosions, so a blast on the second of its
+        two lethal steps has a timer of 1 and encodes as **0** -- lethal, and
+        invisible in that plane.  ``lethal_tau0`` is what actually carries it.
+
+        Returns ``None`` for a dead agent, as the engine does.
+        """
+        if self.agents[me].dead:
+            return None
+        a = self.agents[me]
+        explosion_map = np.zeros(self.arena.shape)
+        for ex in self.explosions:
+            if ex.dangerous:
+                for cx, cy in ex.coords:
+                    explosion_map[cx, cy] = max(explosion_map[cx, cy], ex.timer - 1)
+        return {
+            "round": round_no,
+            "step": self.step_no,
+            "field": np.array(self.arena),
+            "self": (a.name, a.score, a.bombs_left, (a.x, a.y)),
+            "others": [(o.name, o.score, o.bombs_left, (o.x, o.y))
+                       for i in self.active if (o := self.agents[i]) is not a],
+            "bombs": [((b.x, b.y), b.timer) for b in self.bombs],
+            "coins": [(cx, cy) for cx, cy, collectable in self.coins if collectable],
+            "user_input": None,
+            "explosion_map": explosion_map,
+        }
 
     def state(self):
         """A hashable digest of everything a step can change.

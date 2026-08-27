@@ -321,40 +321,6 @@ class Sim:
                     out[cx, cy] = True
         return out
 
-    def to_game_state(self, me: int, round_no: int = 1) -> dict:
-        """The dict the engine would hand agent ``me`` in this position.
-
-        Byte-for-byte what ``GenericWorld.get_state_for_agent`` builds, because
-        it is fed to :func:`lib.encode.planes` and any difference between a
-        searched position and a played one is a difference the network was never
-        trained on.  That includes the ``explosion_map`` quirk: it stores
-        ``timer - 1`` of *dangerous* explosions, so a blast on the second of its
-        two lethal steps has a timer of 1 and encodes as **0** -- lethal, and
-        invisible in that plane.  ``lethal_tau0`` is what actually carries it.
-
-        Returns ``None`` for a dead agent, as the engine does.
-        """
-        if self.agents[me].dead:
-            return None
-        a = self.agents[me]
-        explosion_map = np.zeros(self.arena.shape)
-        for ex in self.explosions:
-            if ex.dangerous:
-                for cx, cy in ex.coords:
-                    explosion_map[cx, cy] = max(explosion_map[cx, cy], ex.timer - 1)
-        return {
-            "round": round_no,
-            "step": self.step_no,
-            "field": np.array(self.arena),
-            "self": (a.name, a.score, a.bombs_left, (a.x, a.y)),
-            "others": [(o.name, o.score, o.bombs_left, (o.x, o.y))
-                       for i in self.active if (o := self.agents[i]) is not a],
-            "bombs": [((b.x, b.y), b.timer) for b in self.bombs],
-            "coins": [(cx, cy) for cx, cy, collectable in self.coins if collectable],
-            "user_input": None,
-            "explosion_map": explosion_map,
-        }
-
     def state(self):
         """A hashable digest of everything a step can change.
 

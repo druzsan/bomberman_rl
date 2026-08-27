@@ -134,6 +134,58 @@ class ConformanceTest(unittest.TestCase):
         return "\n".join(lines) or "  (state() differs but no field does -- check state())"
 
 
+class ObservationTest(unittest.TestCase):
+    """A searched position must encode exactly as a played one.
+
+    The search evaluates leaves with the shipped network, so if
+    ``Sim.to_game_state`` differs from ``get_state_for_agent`` by one plane the
+    network is being asked about states it has never seen -- and it will answer
+    anyway.  This walks a real game and compares both the raw dict and the
+    encoded planes for every living agent at every step.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        quiet_logging()
+
+    def test_observations_match_the_engine(self):
+        from environment import BombeRLeWorld
+        from lib import danger, encode
+
+        tmp = Path(tempfile.mkdtemp(prefix="simobs-"))
+        try:
+            args = make_args(scenario="classic", log_dir=str(tmp / "logs"))
+            world = BombeRLeWorld(args, [(a, False) for a in AGENTS])
+            world.rng = np.random.default_rng(5)
+            compared = 0
+            for _ in range(2):
+                world.new_round()
+                while world.running:
+                    world.do_step()
+                    sim = Sim.from_world(world)
+                    for i, agent in enumerate(world.agents):
+                        want = world.get_state_for_agent(agent)
+                        got = sim.to_game_state(i, round_no=world.round)
+                        if want is None:
+                            self.assertIsNone(got)
+                            continue
+                        for key in ("step", "self", "others", "bombs", "coins"):
+                            self.assertEqual(got[key], want[key], key)
+                        np.testing.assert_array_equal(got["field"], want["field"])
+                        np.testing.assert_array_equal(got["explosion_map"],
+                                                      want["explosion_map"])
+                        np.testing.assert_array_equal(
+                            encode.planes(got, danger.lethal_bits(
+                                got["field"], got["bombs"], got["explosion_map"])),
+                            encode.planes(want, danger.lethal_bits(
+                                want["field"], want["bombs"], want["explosion_map"])))
+                        compared += 1
+            world.end()
+            self.assertGreater(compared, 200)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class BlastGeometryTest(unittest.TestCase):
     """§2.4 of the plan: blasts stop at walls and pass *through* crates."""
 

@@ -20,7 +20,16 @@ import unittest
 import numpy as np
 
 from lib.board import ACTIONS
-from lib.search import COIN_COLLECTED, KILLED_SELF, SearchConfig, legal_actions, search, step_reward
+from lib.search import (
+    COIN_COLLECTED,
+    KILLED_SELF,
+    MOVED,
+    WAITED,
+    SearchConfig,
+    legal_actions,
+    search,
+    step_reward,
+)
 from lib.sim import Sim, SimAgent
 
 
@@ -53,6 +62,9 @@ def cfg(**kw) -> SearchConfig:
     :class:`LeafCapTest` checks the cap on its own.
     """
     kw.setdefault("max_leaves", 100_000)
+    # The potential correction is real and is tested on its own below; here it
+    # would put a state-dependent term into arithmetic meant to be exact.
+    kw.setdefault("use_potential", False)
     return SearchConfig(**kw)
 
 
@@ -92,37 +104,51 @@ class LegalActionTest(unittest.TestCase):
 
 
 class BackupArithmeticTest(unittest.TestCase):
-    """With a known evaluator the answer is arithmetic, not judgement."""
+    """With a known evaluator the answer is arithmetic, not judgement.
 
-    def test_a_flat_evaluator_gives_every_action_the_same_value(self):
-        conf = cfg(depth=3, gamma=0.95)
-        r = search(solo(), 0, constant(2.0), conf)
-        finite = r.values[np.isfinite(r.values)]
-        self.assertEqual(len(finite), 6)
-        np.testing.assert_allclose(finite, 0.95 ** 3 * 2.0)
+    Every step now carries a small per-action cost (a move -0.02, a wait -0.05,
+    priced as training priced them), so these check *differences* between root
+    actions rather than absolute totals.  A difference is what an ``argmax``
+    reads anyway, and it cancels the step costs the test is not about.
+    """
+
+    def test_moves_in_open_space_are_all_worth_the_same(self):
+        r = search(solo(), 0, constant(2.0), cfg(depth=3, gamma=0.95))
+        moves = [r.values[ACTIONS.index(a)] for a in ("UP", "DOWN", "LEFT", "RIGHT")]
+        np.testing.assert_allclose(moves, moves[0])
+
+    def test_waiting_costs_more_than_moving(self):
+        r = search(solo(), 0, constant(2.0), cfg(depth=1, gamma=0.95))
+        self.assertAlmostEqual(r.values[ACTIONS.index("UP")]
+                               - r.values[ACTIONS.index("WAIT")],
+                               (MOVED - WAITED) * 0.1)
 
     def test_the_leaf_is_discounted_by_the_depth_reached(self):
+        """Isolated by differencing two evaluators: everything else cancels."""
         for depth in (1, 2, 3):
             conf = cfg(depth=depth, gamma=0.9)
-            r = search(solo(), 0, constant(1.0), conf)
-            np.testing.assert_allclose(np.nanmax(r.values[np.isfinite(r.values)]),
-                                       0.9 ** depth)
+            hot = search(solo(), 0, constant(1.0), conf).values
+            cold = search(solo(), 0, constant(0.0), conf).values
+            finite = np.isfinite(hot) & np.isfinite(cold)
+            np.testing.assert_allclose(hot[finite] - cold[finite], 0.9 ** depth)
 
     def test_a_coin_on_the_path_is_counted_once_and_undiscounted_at_t0(self):
         s = solo()
         s.coins = [(9, 8, True)]
         conf = cfg(depth=1, gamma=0.5, reward_scale=0.1)
         r = search(s, 0, constant(0.0), conf)
-        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")],
+        # LEFT and RIGHT are symmetric here, so their step costs cancel exactly.
+        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")]
+                               - r.values[ACTIONS.index("LEFT")],
                                COIN_COLLECTED * 0.1)
-        self.assertAlmostEqual(r.values[ACTIONS.index("LEFT")], 0.0)
 
     def test_a_coin_one_step_further_is_discounted_once(self):
         s = solo()
         s.coins = [(10, 8, True)]
         conf = cfg(depth=2, gamma=0.5, reward_scale=0.1)
         r = search(s, 0, constant(0.0), conf)
-        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")],
+        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")]
+                               - r.values[ACTIONS.index("LEFT")],
                                0.5 * COIN_COLLECTED * 0.1)
 
     def test_illegal_actions_stay_at_minus_infinity(self):
@@ -134,11 +160,75 @@ class BackupArithmeticTest(unittest.TestCase):
     def test_the_search_maximises_over_our_own_actions(self):
         """A reward reachable only by a specific three-step path must be found."""
         conf = cfg(depth=3, gamma=1.0)
-        good = by_position({(11, 8): 10.0})
-        r = search(solo(), 0, good, conf)
-        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")], 10.0)
-        for other in ("LEFT", "UP", "DOWN"):
-            self.assertLess(r.values[ACTIONS.index(other)], 10.0)
+        r = search(solo(), 0, by_position({(11, 8): 10.0}), conf)
+        best = int(np.argmax(np.where(np.isfinite(r.values), r.values, -np.inf)))
+        self.assertEqual(best, ACTIONS.index("RIGHT"))
+        self.assertGreater(r.values[ACTIONS.index("RIGHT")]
+                           - r.values[ACTIONS.index("LEFT")], 9.0)
+
+
+class PotentialTest(unittest.TestCase):
+    """The shaping term the backup has to carry, and why.
+
+    The network's ``Q`` is the value under the *shaped* reward.  Backing up
+    unshaped rewards to it leaves a ``gamma^depth * Phi(leaf)`` term that does
+    not cancel between siblings -- measured at a mean of 0.100 across the
+    siblings of one position, against a decision margin of 0.05.
+    """
+
+    def board_with_a_coin(self) -> Sim:
+        arena = empty_board()
+        arena[15, 15] = 1
+        s = Sim(arena=arena, agents=[SimAgent(8, 8)], active=[0])
+        s.coins = [(12, 8, True)]
+        return s
+
+    def test_it_changes_the_answer_on_a_position_where_phi_differs(self):
+        s = self.board_with_a_coin()
+        flat = search(s, 0, constant(0.0),
+                      SearchConfig(depth=3, max_leaves=10_000, use_potential=False))
+        shaped = search(s, 0, constant(0.0),
+                        SearchConfig(depth=3, max_leaves=10_000, use_potential=True))
+        # The coin is four steps away, out of reach of a depth-3 tree, so
+        # without Phi nothing distinguishes moving towards it from moving away.
+        self.assertAlmostEqual(flat.values[ACTIONS.index("RIGHT")],
+                               flat.values[ACTIONS.index("LEFT")],
+                               msg="without Phi an unreachable coin is invisible")
+        self.assertGreater(shaped.values[ACTIONS.index("RIGHT")],
+                           shaped.values[ACTIONS.index("LEFT")],
+                           "with Phi, closing on the coin is worth more")
+
+    def test_it_is_a_pure_addition_of_gamma_depth_times_phi(self):
+        from lib.rewards import RewardConfig, potential
+        from lib.search import leaf_potentials
+
+        s = self.board_with_a_coin()
+        cfg = SearchConfig(depth=2, gamma=0.9, max_leaves=10_000)
+        states = []
+
+        def spy(batch):
+            states.extend(batch)
+            return np.zeros((len(batch), len(ACTIONS)))
+
+        search(s, 0, spy, cfg)
+        rcfg = RewardConfig(gamma=cfg.gamma, reward_scale=cfg.reward_scale)
+        want = np.array([potential(__import__("lib.features", fromlist=["a"])
+                                   .analyse(g), rcfg) * cfg.reward_scale
+                         for g in states])
+        np.testing.assert_allclose(leaf_potentials(states, cfg), want)
+
+    def test_a_terminal_leaf_carries_no_potential(self):
+        """Phi of a terminal state is 0 -- that is what makes it telescope."""
+        arena = empty_board()
+        arena[15, 15] = 1
+        s = Sim(arena=arena, agents=[SimAgent(1, 1)], active=[0])
+        from lib.sim import SimBomb
+        s.bombs = [SimBomb(1, 1, 0, timer=0)]
+        r = search(s, 0, constant(5.0), SearchConfig(depth=1, use_potential=True))
+        # Every action dies this step, so no leaf term of any kind is attached
+        # and only the death price and the action's own step cost remain.
+        finite = r.values[np.isfinite(r.values)]
+        np.testing.assert_allclose(finite, KILLED_SELF * 0.1, atol=0.006)
 
 
 class StepRewardTest(unittest.TestCase):
@@ -148,11 +238,13 @@ class StepRewardTest(unittest.TestCase):
         after = before.copy()
         after.agents[0].score += 5
         after.killed = [(1, 0)]
-        self.assertAlmostEqual(step_reward(before, after, 0, conf), 15.0)
+        self.assertAlmostEqual(step_reward(before, after, 0, "WAIT", conf),
+                               15.0 + WAITED)
 
         after2 = before.copy()
         after2.agents[0].score += 1
-        self.assertAlmostEqual(step_reward(before, after2, 0, conf), 3.0)
+        self.assertAlmostEqual(step_reward(before, after2, 0, "WAIT", conf),
+                               3.0 + WAITED)
 
     def test_a_suicide_is_priced_below_being_killed(self):
         conf = SearchConfig(reward_scale=1.0)
@@ -161,9 +253,10 @@ class StepRewardTest(unittest.TestCase):
         mine.killed = [(0, 0)]
         theirs = before.copy()
         theirs.killed = [(0, 1)]
-        self.assertAlmostEqual(step_reward(before, mine, 0, conf), KILLED_SELF)
-        self.assertLess(step_reward(before, mine, 0, conf),
-                        step_reward(before, theirs, 0, conf))
+        self.assertAlmostEqual(step_reward(before, mine, 0, "WAIT", conf),
+                               KILLED_SELF + WAITED)
+        self.assertLess(step_reward(before, mine, 0, "WAIT", conf),
+                        step_reward(before, theirs, 0, "WAIT", conf))
 
 
 class SafetyTest(unittest.TestCase):

@@ -21,15 +21,27 @@ with ``r_t`` the events the engine actually pays for, priced exactly as
 death -2.0 for a suicide and -1.5 otherwise, all after ``reward_scale``).  Our
 own actions maximise; the opponents follow :data:`OPPONENT_POLICIES`.
 
-**The one known inconsistency**, stated because it is the reason this has to be
-measured rather than assumed to help.  Training used potential-based shaping, so
-the network's ``Q`` is ``Q_true - Phi(s)``; the rewards backed up here are the
-unshaped ones.  The mismatch is a ``gamma^depth * Phi(leaf)`` term that does not
-cancel between siblings.  Recomputing ``Phi`` needs :func:`lib.features.analyse`
-at 0.53 ms a node, which the budget cannot take at a few hundred nodes, so the
-choice is to leave it out and let the held-out block say whether the search is
-worth its latency.  Every leaf sits at the same depth, which is what keeps the
-comparison between root actions honest even so.
+**Why the leaf value carries a potential term.**  Training used potential-based
+shaping, so the network's ``Q`` is the value under the *shaped* reward while the
+rewards backed up along a path here are the engine's own.  Writing the shaped
+return of a ``d``-step path out, the shaping telescopes:
+
+    sum_t gamma^t (r_t + gamma*Phi(s_t+1) - Phi(s_t))
+        = sum_t gamma^t r_t  +  gamma^d Phi(s_d)  -  Phi(s_0)
+
+``Phi(s_0)`` is the same for every root action and drops out of an ``argmax``;
+``gamma^d * Phi(leaf)`` does not, and it is added.  Paths that end in a death or
+a finished round need no correction at all -- ``Phi`` of a terminal state is 0
+by convention, which is exactly what makes the telescoping hold.
+
+Leaving it out was the first implementation and it was wrong in a way worth
+recording, because the size of the error is not obvious.  Measured over 65 real
+positions, ``gamma^3 * Phi(leaf)`` varies by a **mean of 0.100 and up to 0.214
+across the siblings of one position**, while the agent only consults the search
+when the flat top-2 gap is below **0.05**.  The omitted term was on average
+twice the whole margin it was competing with, so the search's disagreements were
+substantially an artefact of it.  The correction costs 0.65 ms a leaf against
+~3 ms for the network evaluation of the same leaf.
 
 **Opponents.**  The default model freezes them.  It is not a claim that they
 stand still; it is that at depth three the things they can do that matter are
@@ -51,15 +63,41 @@ import numpy as np
 from .board import ACTIONS
 from .sim import Sim
 
-#: The engine events a depth-3 search can actually observe, priced as
-#: ``lib.rewards.DEFAULT_EVENT_REWARDS`` priced them, before ``reward_scale``.
-#: Kept as literals for the same reason ``lib.sim`` keeps the rule constants:
-#: ``lib`` is vendored per agent and must not reach out of itself.
+_DELTA = ("UP", "DOWN", "LEFT", "RIGHT")
+
+#: The events this search can price, at ``lib.rewards.DEFAULT_EVENT_REWARDS``'s
+#: values and before ``reward_scale``.  Literals for the same reason
+#: ``lib.sim`` keeps the rule constants: ``lib`` is vendored per agent.
 COIN_COLLECTED = 3.0
 KILLED_OPPONENT = 15.0
 KILLED_SELF = -20.0
 GOT_KILLED = -15.0
 SURVIVED_ROUND = 5.0
+CRATE_DESTROYED = 0.4
+MOVED = -0.02
+WAITED = -0.05
+ESCAPED_DANGER = 1.0
+MOVED_INTO_DANGER = -1.0
+STAYED_IN_DANGER = -0.05
+
+#: Events the trained reward contains that this search does **not** price, with
+#: why.  They are a known residual between the backed-up return and the return
+#: the network's ``Q`` actually estimates, and the size of that residual is the
+#: main reason the search has to be measured rather than assumed to help.
+#:
+#: ``COIN_FOUND``            coins under crates are not observable at all.
+#: ``GOOD_BOMB``,            the four bomb-quality events need
+#: ``USELESS_BOMB``,         ``features.analyse`` on *both* states of every
+#: ``SUICIDAL_BOMB``,        transition, at ~1.3 ms a node against ~3 ms for
+#: ``BOMB_NEAR_OPPONENT``,   the network evaluation of a leaf -- and
+#: ``TRAPPED_OPPONENT``      ``SUICIDAL_BOMB`` in particular is a *proxy* for a
+#:                           death that this search observes directly.
+#: ``LOOP``,                 need a visit history the search does not carry
+#: ``WALKED_INTO_DEAD_END``  across the tree.
+#: ``INVALID_ACTION``        never generated: `legal_actions` filters them.
+UNPRICED = ("COIN_FOUND", "GOOD_BOMB", "USELESS_BOMB", "SUICIDAL_BOMB",
+            "BOMB_NEAR_OPPONENT", "TRAPPED_OPPONENT", "LOOP",
+            "WALKED_INTO_DEAD_END")
 
 
 @dataclass(slots=True)
@@ -68,6 +106,10 @@ class SearchConfig:
     gamma: float = 0.95
     reward_scale: float = 0.1
     opponents: str = "frozen"
+    #: Add ``gamma^depth * Phi(leaf)`` so the backup is consistent with the
+    #: shaped reward the network was trained on.  Off is the (wrong) arithmetic
+    #: this module shipped with first, kept only so the ablation can be run.
+    use_potential: bool = True
     #: Hard cap on network evaluations per step.  Expansion stops one level
     #: short rather than exceed it, which bounds latency **without consulting a
     #: clock**: a wall-clock cut-off would make the policy depend on machine
@@ -115,8 +157,15 @@ def legal_actions(sim: Sim, me: int) -> list[str]:
     return out
 
 
-def step_reward(before: Sim, after: Sim, me: int, cfg: SearchConfig) -> float:
-    """What the engine paid us for this step, in the network's units."""
+def step_reward(before: Sim, after: Sim, me: int, action: str,
+                cfg: SearchConfig) -> float:
+    """What this step was worth, priced as the training reward priced it.
+
+    Everything here is read off the two positions or off the action, which is
+    what keeps it cheap; :data:`UNPRICED` lists what is left out and why.  The
+    danger transitions are the one term that costs anything, and it is 0.005 ms
+    a state.
+    """
     r = 0.0
     coins = after.agents[me].score - before.agents[me].score
     kills = sum(1 for victim, killer in after.killed
@@ -127,7 +176,48 @@ def step_reward(before: Sim, after: Sim, me: int, cfg: SearchConfig) -> float:
     for victim, killer in after.killed:
         if victim == me:
             r += KILLED_SELF if killer == me else GOT_KILLED
+    # Crates we destroyed.  Only our own bombs detonate into a crate on a step
+    # where nobody else's does, in the overwhelming majority of positions; the
+    # search attributes the whole arena delta to us, which is the same
+    # simplification the frozen opponent model already makes.
+    r += CRATE_DESTROYED * int(np.count_nonzero(before.arena == 1)
+                               - np.count_nonzero(after.arena == 1))
+    r += WAITED if action == "WAIT" else (MOVED if action in _DELTA else 0.0)
+    if not after.agents[me].dead:
+        was = _in_danger(before, me)
+        now = _in_danger(after, me)
+        if was and not now:
+            r += ESCAPED_DANGER
+        elif now and not was:
+            r += MOVED_INTO_DANGER
+        elif was and now:
+            r += STAYED_IN_DANGER
     return r * cfg.reward_scale
+
+
+def _in_danger(sim: Sim, me: int) -> bool:
+    """Is our tile lethal within the danger horizon, as `lib.danger` defines it?"""
+    from . import danger
+
+    a = sim.agents[me]
+    lethal = danger.lethal_bits(sim.arena, [((b.x, b.y), b.timer) for b in sim.bombs],
+                                sim.danger_map().astype(float))
+    return bool(lethal[a.x, a.y])
+
+
+def leaf_potentials(states: list[dict], cfg: SearchConfig) -> np.ndarray:
+    """``Phi(s)`` for each leaf, in the network's units.
+
+    The weights come from :class:`lib.rewards.RewardConfig`'s defaults, which is
+    what the shipped run trained with; only ``gamma`` and ``reward_scale``,
+    which the search already knows, are overridden.  Imported here rather than
+    at module scope so a caller that sets ``use_potential=False`` pays nothing.
+    """
+    from . import features, rewards
+
+    rcfg = rewards.RewardConfig(gamma=cfg.gamma, reward_scale=cfg.reward_scale)
+    return np.array([rewards.potential(features.analyse(gs), rcfg) * cfg.reward_scale
+                     for gs in states])
 
 
 def search(sim: Sim, me: int, evaluate, cfg: SearchConfig | None = None,
@@ -172,7 +262,8 @@ def search(sim: Sim, me: int, evaluate, cfg: SearchConfig | None = None,
                 child = node.copy()
                 child.step({me: action, **others})
                 nodes += 1
-                gained = acc + cfg.gamma ** t * step_reward(node, child, me, cfg)
+                gained = acc + cfg.gamma ** t * step_reward(node, child, me,
+                                                            action, cfg)
                 if child.agents[me].dead:
                     offer(root, gained)
                     continue
@@ -201,12 +292,13 @@ def search(sim: Sim, me: int, evaluate, cfg: SearchConfig | None = None,
     if frontier:
         states = [node.to_game_state(me) for node, _, _ in frontier]
         q = np.asarray(evaluate(states))
+        phi = leaf_potentials(states, cfg) if cfg.use_potential else np.zeros(len(states))
         discount = cfg.gamma ** reached
-        for (node, root, acc), row in zip(frontier, q):
+        for (node, root, acc), row, p in zip(frontier, q, phi):
             allowed = set(legal_actions(node, me))
             legal = np.array([a in allowed for a in ACTIONS])
             leaf_v = float(row[legal].max()) if legal.any() else float(row.max())
-            offer(root, acc + discount * leaf_v)
+            offer(root, acc + discount * (leaf_v + p))
 
     for root, value in settled.items():
         values[root] = value

@@ -404,6 +404,12 @@ def main(argv=None) -> int:
     c.add_argument("--scenario", default="classic")
     c.add_argument("--gamma", type=float, default=0.99)
     c.add_argument("--reward-scale", type=float, default=0.1)
+    c.add_argument("--config", default=None,
+                   help="take the RewardConfig from this run config instead of "
+                        "--gamma/--reward-scale.  A dataset stores *rewards*, not "
+                        "events, so an arm that changes the reward function needs "
+                        "demonstrations recorded under that same function or its "
+                        "expert minibatches disagree with its on-policy ones.")
     c.add_argument("--seed", type=int, default=1)
 
     t = sub.add_parser("train", help="behaviour-clone the network")
@@ -429,7 +435,12 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "collect":
-        cfg = RewardConfig(gamma=args.gamma, reward_scale=args.reward_scale)
+        if args.config:
+            from .dqn_driver import load_config
+
+            cfg = load_config(args.config)["reward"]
+        else:
+            cfg = RewardConfig(gamma=args.gamma, reward_scale=args.reward_scale)
         meta = collect(Path(args.out), episodes=args.episodes, workers=args.workers,
                        noise=args.noise, seed=args.seed, scenario=args.scenario,
                        reward_cfg=cfg, shield=not args.unshielded_noise)

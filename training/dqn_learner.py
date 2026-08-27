@@ -38,6 +38,7 @@ the planes were stored expanded.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 
@@ -182,10 +183,34 @@ class DQNLearner:
         return float(b0 + (b1 - b0) * min(max(frac, 0.0), 1.0))
 
     def margin_weight(self, frac: float) -> float:
+        """DQfD margin weight at training fraction ``frac``.
+
+        E13 measured that the *linear* schedule below produces exactly one
+        catastrophic checkpoint per run, at precisely the step where the weight
+        reaches zero (three runs, three confirmations; the run without a margin
+        has none).  The mechanism is that the margin term suppresses ``Q`` for
+        every action the expert did not take, so removing it un-pins the
+        ``argmax`` faster than TD learning can re-calibrate those values.
+
+        ``margin_anneal = "cosine"`` spreads the removal out: the weight is
+        already within a few percent of zero for the last third of the window,
+        and its derivative goes to zero at the endpoint rather than jumping.
+        ``margin_floor`` (a fraction of ``margin_weight``) keeps a residual
+        term that never vanishes -- effective against the same failure, at the
+        cost of biasing the final policy towards the expert forever.
+        """
         end = self.cfg.get("margin_anneal_frac", 0.0)
         if end <= 0:
             return 0.0
-        return float(self.cfg["margin_weight"] * max(0.0, 1.0 - frac / end))
+        w0 = float(self.cfg["margin_weight"])
+        floor = float(self.cfg.get("margin_floor", 0.0)) * w0
+        if frac >= end:
+            return floor
+        if self.cfg.get("margin_anneal", "linear") == "cosine":
+            decay = 0.5 * (1.0 + math.cos(math.pi * frac / end))
+        else:
+            decay = 1.0 - frac / end
+        return float(floor + (w0 - floor) * max(0.0, decay))
 
     # -- one gradient step ------------------------------------------------
     def update(self, frac: float) -> dict:

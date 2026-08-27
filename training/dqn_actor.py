@@ -45,7 +45,7 @@ from .engine import (
 #: Worlds are expensive to build (each one attaches logger handlers), so they
 #: are cached; a league with many frozen opponents would otherwise grow the
 #: cache without bound.
-MAX_WORLDS = 12
+MAX_WORLDS = 16
 
 
 @dataclass
@@ -97,6 +97,12 @@ class Actor:
         from .engine import patch_settings
 
         stage = self.cfg.stages[stage_index]
+        if stage.get("scenario_mix") and any(
+                stage.get(k) is not None for k in ("crate_density", "coin_count")):
+            # patch_settings rewrites one scenario's entry; the others in the
+            # mix would silently stay stock, which is not what anyone means.
+            raise ValueError("scenario_mix cannot be combined with "
+                             "crate_density / coin_count overrides")
         reset_engine_loggers()
         self.worlds.clear()
         patch_settings(cols=stage.get("cols"), rows=stage.get("rows"),
@@ -106,8 +112,8 @@ class Actor:
                        scenario=stage["scenario"])
         self.stage = stage_index
 
-    def _world_for(self, stage: dict, opponents: tuple[str, ...]):
-        key = (stage["scenario"], opponents)
+    def _world_for(self, scenario: str, opponents: tuple[str, ...]):
+        key = (scenario, opponents)
         world = self.worlds.get(key)
         if world is not None:
             return world
@@ -119,7 +125,7 @@ class Actor:
         model = next((path for _, path in parsed if path), None)
         set_model_env(model)
         try:
-            world = make_world(specs, scenario=stage["scenario"],
+            world = make_world(specs, scenario=scenario,
                                log_dir=str(REPO / "logs" / f"actor-{os.getpid()}"),
                                continue_without_training=False)
         finally:
@@ -146,6 +152,30 @@ class Actor:
         i = int(self.rng.choice(len(mix), p=weights / weights.sum()))
         return tuple(mix[i][1])
 
+    def _sample_episode(self, stage: dict) -> tuple[str, tuple[str, ...]]:
+        """Pick this episode's scenario *and* opponents.
+
+        ``scenario_mix`` is optional; without it a stage behaves exactly as
+        before and every episode uses ``stage["scenario"]``.  Entries are
+        ``(weight, scenario, opponents)`` where ``opponents=None`` means "draw
+        from ``opponent_mix`` as usual" -- keeping the two mixtures separate is
+        what lets the league machinery rewrite ``opponent_mix`` in place
+        (``dqn_driver.push_league``) without ever seeing a scenario.
+
+        ``build_arena`` reads ``settings.SCENARIOS[args.scenario]`` afresh every
+        round and ``args.scenario`` is fixed per world, so switching scenarios
+        per episode is exactly a matter of picking a different cached world.
+        """
+        mix = stage.get("scenario_mix")
+        if not mix:
+            return stage["scenario"], self._sample_opponents(stage)
+        weights = np.array([e[0] for e in mix], dtype=float)
+        i = int(self.rng.choice(len(mix), p=weights / weights.sum()))
+        _, scenario, opponents = mix[i]
+        if opponents is None:
+            return scenario, self._sample_opponents(stage)
+        return scenario, tuple(opponents)
+
     # -- main loop --------------------------------------------------------
     def run(self) -> None:
         ctrl = self.ctrl
@@ -156,7 +186,7 @@ class Actor:
             stage = self.cfg.stages[self.stage]
             self._refresh_league()
             self.policy.maybe_refresh()
-            world = self._world_for(stage, self._sample_opponents(stage))
+            world = self._world_for(*self._sample_episode(stage))
             world.rng = np.random.default_rng(int(self.rng.integers(1 << 62)))
             world.new_round()
             while world.running and ctrl[self.ctrl_slots.STOP] < 0.5:

@@ -365,6 +365,29 @@ class Sim:
             return True
         return self.step_no >= MAX_STEPS
 
+    def explosion_map(self) -> np.ndarray:
+        """The engine's ``explosion_map``: ``timer - 1`` over dangerous blasts.
+
+        Its one non-obvious property is the one everything depends on.  A blast
+        at ``timer == 1`` is still stage 0 and still in ``self.explosions``, but
+        ``update_explosions`` moves it to stage 1 *before* ``evaluate_explosions``
+        looks at it, so it cannot kill anybody again -- and it encodes as 0, not
+        as 1.  ``explosion_map >= 1`` therefore means exactly "lethal during the
+        step you are about to take", which is what both the network's channel 10
+        and :func:`lib.danger.lethal_bits` read it as.
+
+        :meth:`danger_map` answers the *other* question -- "is this tile lethal
+        right now" -- and the two differ by exactly the expiring blast.  Using
+        one where the other is meant is a one-step error in every safety
+        calculation downstream.
+        """
+        out = np.zeros(self.arena.shape)
+        for ex in self.explosions:
+            if ex.dangerous:
+                for cx, cy in ex.coords:
+                    out[cx, cy] = max(out[cx, cy], ex.timer - 1)
+        return out
+
     def danger_map(self) -> np.ndarray:
         """Tiles lethal *right now*, i.e. covered by a stage-0 explosion."""
         out = np.zeros_like(self.arena, dtype=bool)
@@ -390,11 +413,6 @@ class Sim:
         if self.agents[me].dead:
             return None
         a = self.agents[me]
-        explosion_map = np.zeros(self.arena.shape)
-        for ex in self.explosions:
-            if ex.dangerous:
-                for cx, cy in ex.coords:
-                    explosion_map[cx, cy] = max(explosion_map[cx, cy], ex.timer - 1)
         return {
             "round": round_no,
             "step": self.step_no,
@@ -405,7 +423,7 @@ class Sim:
             "bombs": [((b.x, b.y), b.timer) for b in self.bombs],
             "coins": [(cx, cy) for cx, cy, collectable in self.coins if collectable],
             "user_input": None,
-            "explosion_map": explosion_map,
+            "explosion_map": self.explosion_map(),
         }
 
     def state(self):

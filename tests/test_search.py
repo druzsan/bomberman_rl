@@ -345,6 +345,20 @@ class BookkeepingTest(unittest.TestCase):
         r = search(solo(), 0, constant(0.0), cfg(depth=3))
         self.assertLess(r.nodes, 6 ** 3 + 6 ** 2 + 6)
 
+    def test_a_duplicate_position_keeps_the_better_path(self):
+        """Two routes to one tile, one of them through a coin."""
+        arena = empty_board()
+        arena[15, 15] = 1
+        s = Sim(arena=arena, agents=[SimAgent(8, 8)], active=[0])
+        s.coins = [(9, 8, True)]                 # on the way if we go right first
+        conf = cfg(depth=2, gamma=1.0, reward_scale=0.1)
+        r = search(s, 0, constant(0.0), conf)
+        # RIGHT then DOWN, and DOWN then RIGHT, both end at (9, 9); only the
+        # first collects.  Dedup must not decide which by arrival order.
+        self.assertAlmostEqual(r.values[ACTIONS.index("RIGHT")]
+                               - r.values[ACTIONS.index("DOWN")],
+                               COIN_COLLECTED * 0.1)
+
     def test_the_root_position_is_not_mutated(self):
         s = solo()
         before = s.state()

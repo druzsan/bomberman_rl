@@ -196,12 +196,18 @@ def step_reward(before: Sim, after: Sim, me: int, action: str,
 
 
 def _in_danger(sim: Sim, me: int) -> bool:
-    """Is our tile lethal within the danger horizon, as `lib.danger` defines it?"""
+    """Is our tile lethal within the danger horizon, as `lib.danger` defines it?
+
+    Built on :meth:`Sim.explosion_map`, not :meth:`Sim.danger_map`.  The two
+    differ on a blast whose timer has reached 1: it is lethal *right now* and
+    cannot be lethal again, and counting it as danger going forward would
+    charge ``STAYED_IN_DANGER`` for standing on a blast that is already over.
+    """
     from . import danger
 
     a = sim.agents[me]
     lethal = danger.lethal_bits(sim.arena, [((b.x, b.y), b.timer) for b in sim.bombs],
-                                sim.danger_map().astype(float))
+                                sim.explosion_map())
     return bool(lethal[a.x, a.y])
 
 
@@ -252,7 +258,12 @@ def search(sim: Sim, me: int, evaluate, cfg: SearchConfig | None = None,
     reached = 0
     for t in range(cfg.depth):
         children: list[tuple[Sim, int, float]] = []
-        seen: set[tuple] = set()
+        # key -> index into `children`.  Two action sequences can reach the same
+        # position having earned different rewards on the way (one picked up a
+        # coin, the other did not), so the duplicate is resolved by *value*
+        # rather than by arrival order -- keeping the first would silently throw
+        # away the better line.
+        seen: dict[tuple, int] = {}
         for node, root, acc in frontier:
             # At the root each entry carries its own action; deeper, every legal
             # action is tried from every surviving node.
@@ -272,9 +283,12 @@ def search(sim: Sim, me: int, evaluate, cfg: SearchConfig | None = None,
                           * SURVIVED_ROUND * cfg.reward_scale)
                     continue
                 key = (root, child.state())
-                if key in seen:
+                index = seen.get(key)
+                if index is not None:
+                    if gained > children[index][2]:
+                        children[index] = (child, root, gained)
                     continue
-                seen.add(key)
+                seen[key] = len(children)
                 children.append((child, root, gained))
         if t > 0 and len(children) > cfg.max_leaves:
             # Keep the level we already have rather than pay for this one.  The

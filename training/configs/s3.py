@@ -16,6 +16,10 @@ Deliberate deviations from ``dev/plan.md`` §S3, each with a reason:
   potential-based shaping term is ``gamma * phi(s') - phi(s)``; if its gamma
   disagrees with the learner's, the shaping stops being potential-based and
   starts changing the optimal policy.
+* **A cosine margin anneal** rather than the linear one this config shipped
+  with; see the comment on ``margin_anneal`` below, and E15-B.  The runs that
+  produced the submission predate it, and their own ``config.json`` records
+  what they actually used.
 * **One stage, not a warm-up ladder.**  E07 measured that a curriculum stage
   which removes an action biases the value function against that action in
   every later stage.  With behaviour cloning doing the bootstrapping, a warm-up
@@ -86,6 +90,15 @@ def config() -> dict:
         margin=0.5,
         margin_weight=1.0,
         margin_anneal_frac=0.20,
+        # E15-B.  With the linear schedule, four runs out of four produced
+        # exactly one 95-100 % suicide checkpoint, at precisely the step the
+        # weight reaches zero; the run without a margin loss had none anywhere.
+        # Cosine reaches zero at the same step with 38x less weight just before
+        # it and no derivative jump, and the collapse disappears from the whole
+        # curve (minimum 4.30 against 1.36-2.24) at no cost to the final score
+        # (6.10 vs 6.08 over the last 4 M steps, p = 0.65).
+        margin_anneal="cosine",
+        margin_floor=0.0,
         # -- actors
         actors=20,
         eps_ladder=True,

@@ -155,16 +155,25 @@ class ConfigDiffTest(unittest.TestCase):
         and E13's collapsed checkpoint is at 1 600 360.  What has to be smaller
         is the weight *just before* that step.
         """
-        base = self.load("training/configs/s3_gamma95.py")
         margin = self.load("training/configs/s3_margin.py")
-        near = 0.99 * base["margin_anneal_frac"]
-        w = lambda cfg: DQNLearner.margin_weight(SimpleNamespace(cfg=cfg), near)
-        self.assertGreater(w(base), 0.005)
-        self.assertLess(w(margin), w(base) / 20.0)
-        self.assertAlmostEqual(w(base), w(margin), places=1)  # both are near zero
-        for key in set(base) | set(margin):
-            if key not in ("margin_anneal", "margin_floor"):
-                self.assertEqual(repr(base[key]), repr(margin[key]), key)
+        self.assertEqual(margin["margin_anneal"], "cosine")
+        end = margin["margin_anneal_frac"]
+        near = 0.99 * end
+
+        def weight(shape):
+            cfg = dict(margin, margin_anneal=shape)
+            return DQNLearner.margin_weight(SimpleNamespace(cfg=cfg), near)
+
+        # The property that matters is not that the arm differs from its base --
+        # cosine is the default since E15-B, so it no longer does -- but that
+        # the schedule the config selects is the gentle one at the endpoint,
+        # which is where four runs collapsed.
+        self.assertGreater(weight("linear"), 0.005)
+        self.assertLess(weight("cosine"), weight("linear") / 20.0)
+
+    def test_the_base_config_defaults_to_the_gentle_anneal(self):
+        for path in ("training/configs/s3.py", "training/configs/s3_gamma95.py"):
+            self.assertEqual(self.load(path).get("margin_anneal"), "cosine", path)
 
     def test_coinheaven_differs_from_gamma95_only_in_the_scenario_mix(self):
         base = self.load("training/configs/s3_gamma95.py")

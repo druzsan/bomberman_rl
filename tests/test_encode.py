@@ -209,6 +209,7 @@ class TestTimeAugmentationTestCase(unittest.TestCase):
         ctx = type("Ctx", (), {})()
         ctx.torch = torch
         ctx.net = net
+        ctx.nets = [net]
         ctx.plane_set = "full"
         ctx.tta = True
 
@@ -220,6 +221,37 @@ class TestTimeAugmentationTestCase(unittest.TestCase):
             want = base[symmetry.ACTION_MAP[symmetry.INVERSE[g]]]
             np.testing.assert_allclose(got, want, atol=1e-5,
                                        err_msg=f"group element {g}")
+
+    def test_an_ensemble_average_is_equivariant_too(self):
+        """The property has to survive the second averaging axis.
+
+        Each member is D4-equivariant on its own, so their mean is as well --
+        but only if the per-member action mapping happens *before* the mean and
+        not after, which is the kind of thing that still produces plausible
+        numbers when it is wrong.
+        """
+        import torch
+
+        from agent_code.dqn_agent import callbacks
+        from lib import symmetry
+        from lib.qnet import QNet, QNetConfig
+
+        nets = []
+        for seed in (0, 1):
+            torch.manual_seed(seed)
+            nets.append(QNet(QNetConfig(channels=8, blocks=1)).eval())
+        ctx = type("Ctx", (), {})()
+        ctx.torch, ctx.net, ctx.nets = torch, nets[0], nets
+        ctx.plane_set, ctx.tta = "full", True
+
+        state = make_state(6)
+        base = callbacks.q_values(ctx, callbacks.StateView(state), state)
+        for g in range(symmetry.N_G):
+            moved = symmetry.transform_state(state, g)
+            got = callbacks.q_values(ctx, callbacks.StateView(moved), moved)
+            np.testing.assert_allclose(
+                got, base[symmetry.ACTION_MAP[symmetry.INVERSE[g]]], atol=1e-5,
+                err_msg=f"group element {g}")
 
 
 class ReplayTestCase(unittest.TestCase):

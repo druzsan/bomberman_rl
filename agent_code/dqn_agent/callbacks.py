@@ -142,17 +142,22 @@ def setup(self: AgentContext) -> None:
         # injects a policy with no network at all (the teacher chooses the
         # actions) and must still encode states the same way.
         self.plane_set = TRAINING_POLICY.plane_set
+        self.nets = [self.net] if self.net is not None else []
         self.use_mask = False
         self.tta = False
         self.search = None
         self.search_gap = 0.0
     else:
-        from .lib.qnet import load as load_qnet
+        from .lib.qnet import load_all as load_qnets
 
         # The evaluation harness points one process at one checkpoint through
         # this variable; the graders never set it, so the default must work.
         path = Path(os.environ.get("BOMBERMAN_MODEL", MODEL_FILE))
-        self.net, meta = load_qnet(path)
+        # One artifact can hold several independently trained networks; a
+        # single-network file yields a list of one, so this path is the same
+        # either way.
+        self.nets, meta = load_qnets(path)
+        self.net = self.nets[0]
         self.policy = None
         self.ctrl = None
         self.plane_set = self.net.cfg.plane_set
@@ -160,30 +165,49 @@ def setup(self: AgentContext) -> None:
         self.tta = bool(meta.get("tta", False))
         self.search = search_config(meta)
         self.search_gap = float(meta.get("search_gap", 0.05))
-        self.logger.info("loaded %s: %s, %d parameters, planes=%s, mask=%s, "
-                         "tta=%s, search=%s",
-                         path, type(self.net).__name__, self.net.n_parameters(),
-                         self.plane_set, self.use_mask, self.tta, self.search)
+        self.logger.info("loaded %s: %s x%d, %d parameters each, planes=%s, "
+                         "mask=%s, tta=%s, search=%s",
+                         path, type(self.net).__name__, len(self.nets),
+                         self.net.n_parameters(), self.plane_set, self.use_mask,
+                         self.tta, self.search)
 
 
 def q_values(self: AgentContext, view: StateView, game_state: GameState) -> np.ndarray:
-    """Action values for one state.
+    """Action values for one state, averaged over every view we can afford.
 
-    With ``tta`` set, the state is evaluated in all eight images of the square's
-    symmetry group and the values are averaged after mapping each frame's
-    actions back to the world frame (S6 in ``dev/plan.md``).  The board's wall
-    layout is D4-invariant, so every image is a legitimate view of the same
-    position and the average is a free variance reduction -- eight images fit in
-    one batched forward pass and still cost a fraction of the step budget.
+    Two independent averages, and they compose because they reduce different
+    variance:
+
+    * **``tta``** evaluates the state in all eight images of the square's
+      symmetry group and maps each frame's actions back to the world frame
+      (S6 in ``dev/plan.md``).  The wall layout is D4-invariant, so every image
+      is a legitimate view of the same position.
+    * **the ensemble** averages over the members of the artifact -- separately
+      trained networks answering the same question.
+
+    Averaging Q values directly is only sound because the members share a
+    reward function and a discount, so their value scales agree; ``q_mean``
+    across the runs bundled here differs by under 2 %.  Members trained under
+    different rewards would have to be combined by rank, not by value.
+
+    Cost is ``members x (8 if tta else 1)`` evaluations of ~2 ms each, against a
+    measured budget of ~160 per step.
     """
     planes = encode.planes(game_state, view.lethal, self.plane_set)
     with self.torch.inference_mode():
         if not self.tta:
             x = self.torch.from_numpy(planes).unsqueeze(0)
-            return self.net(x)[0].numpy()
-        images = np.stack([transform_plane(planes, g) for g in range(N_G)])
-        q = self.net(self.torch.from_numpy(images)).numpy()
-        return q[np.arange(N_G)[:, None], ACTION_MAP].mean(axis=0)
+            if len(self.nets) == 1:
+                return self.net(x)[0].numpy()
+            return np.mean([net(x)[0].numpy() for net in self.nets], axis=0)
+        images = self.torch.from_numpy(
+            np.stack([transform_plane(planes, g) for g in range(N_G)]))
+        frames = np.arange(N_G)[:, None]
+        if len(self.nets) == 1:
+            q = self.net(images).numpy()
+            return q[frames, ACTION_MAP].mean(axis=0)
+        return np.mean([net(images).numpy()[frames, ACTION_MAP].mean(axis=0)
+                        for net in self.nets], axis=0)
 
 
 def search_config(meta: dict) -> SearchConfig | None:

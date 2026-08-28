@@ -109,8 +109,35 @@ def save(path: Path | str, net: QNet, meta: dict | None = None) -> None:
                 "meta": meta or {}}, path)
 
 
+def save_ensemble(path: Path | str, nets: list[QNet], meta: dict | None = None,
+                  ) -> None:
+    """Write several networks into one artifact.
+
+    ``state_dict`` still holds the first member, so an artifact written this way
+    loads correctly under :func:`load` and under any reader that predates this
+    function -- it simply sees one network instead of several.  The extra
+    members live in ``members``, and every one of them must share the first's
+    :class:`QNetConfig`: an ensemble whose members disagree about the
+    architecture is a bug, not a configuration.
+    """
+    if not nets:
+        raise ValueError("an ensemble needs at least one member")
+    for i, net in enumerate(nets[1:], 1):
+        if asdict(net.cfg) != asdict(nets[0].cfg):
+            raise ValueError(f"member {i} has a different QNetConfig")
+    torch.save({"format": 2, "config": asdict(nets[0].cfg),
+                "state_dict": {k: v.cpu() for k, v in nets[0].state_dict().items()},
+                "members": [{k: v.cpu() for k, v in n.state_dict().items()}
+                            for n in nets],
+                "meta": meta or {}}, path)
+
+
 def load(path: Path | str, device: str = "cpu") -> tuple[QNet, dict]:
-    """Rebuild a network from an artifact written by :func:`save`."""
+    """Rebuild a network from an artifact written by :func:`save`.
+
+    An ensemble artifact loads as its first member; use :func:`load_all` to get
+    all of them.
+    """
     blob = torch.load(path, map_location=device, weights_only=True)
     cfg = QNetConfig(**blob["config"])
     net = QNet(cfg)
@@ -118,3 +145,18 @@ def load(path: Path | str, device: str = "cpu") -> tuple[QNet, dict]:
     net.to(device)
     net.eval()
     return net, blob.get("meta", {})
+
+
+def load_all(path: Path | str, device: str = "cpu") -> tuple[list[QNet], dict]:
+    """Every member of an artifact; a single-network file yields a list of one."""
+    blob = torch.load(path, map_location=device, weights_only=True)
+    cfg = QNetConfig(**blob["config"])
+    states = blob.get("members") or [blob["state_dict"]]
+    nets = []
+    for state in states:
+        net = QNet(cfg)
+        net.load_state_dict(state)
+        net.to(device)
+        net.eval()
+        nets.append(net)
+    return nets, blob.get("meta", {})
